@@ -551,7 +551,11 @@ function mapActionsHTML(s){
 
 function dir16(d){if(d==null)return'—';var D=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];return D[Math.round(d/22.5)%16]}
 
-function ktRound(v){return Math.round(v||0)}
+// API nulls, omitted values and invalid numbers are unknown, never calm.
+function measurement(v){return typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null}
+function ktRound(v){return measurement(v)==null?null:Math.round(v)}
+function metric(v,unit){return v==null?'Unavailable':v+(unit||'')}
+function sortValue(v){return v==null?Infinity:v}
 function angleDiff(a,b){return Math.abs((a-b+540)%360-180)}
 var ONSHORE={
   'takapuna-beach':75,'mission-bay':45,'kohimarama':45,'st-heliers':55,'okahu-bay':20,
@@ -601,7 +605,23 @@ function skillThresholds(exposed,skill){
   return{windAvoid:exposed?10:12,windCaution:exposed?6:8,gustAvoid:exposed?15:17,gustCaution:exposed?11:12};
 }
 
-function rateSlot(w,g,sh,sp,precip,precipProb,wcode,vis,exposed,isLake,dayRainTotal,airTemp,waterTemp,windCtx,skill){
+// Keep known hazards, but never endorse a slot with incomplete safety data.
+function rateSlot(w,g,sh,sp,precip,precipProb,wcode,vis,exposed,isLake,dayRainTotal,airTemp,waterTemp,windCtx,skill,missingContext){
+  var missing=(missingContext||[]).slice();
+  [[w,'wind speed'],[g,'wind gusts']].concat(isLake?[]:[[sh,'wave height'],[sp,'wave period']]).forEach(function(item){
+    if(measurement(item[0])==null)missing.push(item[1]);
+  });
+  var result=rateAvailableSlot.apply(null,arguments);
+  result.dataComplete=missing.length===0;
+  if(missing.length){
+    result.rating=result.rating==='AVOID'?'AVOID':'CAUTION';
+    result.confidence='Low';
+    result.factors=['Data unavailable: '+missing.join(', ')+'. Safety cannot be fully assessed — check another forecast before paddling.'].concat(result.rating==='AVOID'?result.factors:result.factors.filter(function(f){return !/ideal|minimal swell|small swell|Acceptable sheltered/.test(f)}));
+  }
+  return result;
+}
+
+function rateAvailableSlot(w,g,sh,sp,precip,precipProb,wcode,vis,exposed,isLake,dayRainTotal,airTemp,waterTemp,windCtx,skill){
   var factors=[];
   var rating='GOOD';
 
@@ -781,6 +801,13 @@ function buildDaySummary(slots){
     confidence='Low';
   }
 
+  var incomplete=slots.some(function(s){return s.dataComplete===false});
+  if(incomplete){
+    if(dayRating==='GOOD')dayRating='CAUTION';
+    confidence='Low';
+    dayDesc='Forecast data unavailable for some or all periods. Safety cannot be fully assessed.';
+    if(!goodC)bestWindow='No reliable window — data unavailable';
+  }
   var allFactors=[],seen={};
   slots.forEach(function(s){s.factors.forEach(function(f){if(!seen[f]){seen[f]=true;allFactors.push(f)}})});
   return{dayRating:dayRating,dayDesc:dayDesc,bestWindow:bestWindow,confidence:confidence,allFactors:allFactors}
@@ -795,11 +822,18 @@ function extract(hr,day,keys){return TH.map(function(h){var i=day*24+h,o={};keys
 function calcDayRain(hr,day){var s=day*24,e=Math.min(s+24,(hr.precipitation||[]).length),t=0;for(var i=s;i<e;i++)t+=(hr.precipitation&&hr.precipitation[i])||0;return t}
 function calcPrevDayRain(hr,day){return day===0?0:calcDayRain(hr,day-1)}
 
+async function fetchForecast(url){
+  var response=await fetch(url);
+  if(!response.ok)throw new Error('Forecast HTTP '+response.status);
+  var data=await response.json();
+  if(!data||!data.hourly||!Array.isArray(data.hourly.time))throw new Error('Invalid forecast response');
+  return data;
+}
 async function fetchAll(){
   var p=[];
   SPOTS.forEach(function(s,i){
-    p.push(fetch(wURL(s.lat,s.lng)).then(function(r){return r.json()}).then(function(d){wCache[i]=d}).catch(function(){wCache[i]=null}));
-    if(!s.lake)p.push(fetch(mURL(s.lat,s.lng)).then(function(r){return r.json()}).then(function(d){mCache[i]=d}).catch(function(){mCache[i]=null}));
+    p.push(fetchForecast(wURL(s.lat,s.lng)).then(function(d){wCache[i]=d}).catch(function(){wCache[i]=null}));
+    if(!s.lake)p.push(fetchForecast(mURL(s.lat,s.lng)).then(function(d){mCache[i]=d}).catch(function(){mCache[i]=null}));
   });
   await Promise.allSettled(p);ready=true;
 }
@@ -811,16 +845,16 @@ function getForecast(si,day){
   var mS=(!s.lake&&m&&m.hourly)?extract(m.hourly,day,['wave_height','wave_period','swell_wave_height','sea_surface_temperature']):null;
   var dr=calcDayRain(w.hourly,day),pr=calcPrevDayRain(w.hourly,day),er=dr+(pr*0.3);
   return TH.map(function(h,ti){
-    var ws=wS[ti].wind_speed_10m||0,gs=wS[ti].wind_gusts_10m||0,tmp=Math.round(wS[ti].temperature_2m||0);
-    var wdir=wS[ti].wind_direction_10m,wc=wS[ti].weather_code||0,pp=wS[ti].precipitation_probability||0;
+    var ws=measurement(wS[ti].wind_speed_10m),gs=measurement(wS[ti].wind_gusts_10m),tmp=Math.round(wS[ti].temperature_2m||0);
+    var wdir=measurement(wS[ti].wind_direction_10m),wc=measurement(wS[ti].weather_code),pp=wS[ti].precipitation_probability||0;
     var prcp=wS[ti].precipitation||0,cc=wS[ti].cloud_cover,vis=wS[ti].visibility;
-    var sh=s.lake?0:(mS&&mS[ti]?(mS[ti].wave_height||0):0);
-    var swH=s.lake?0:(mS&&mS[ti]?(mS[ti].swell_wave_height||0):0);
-    var wavP=s.lake?0:(mS&&mS[ti]?(mS[ti].wave_period||0):0);
+    var sh=s.lake?0:measurement(mS&&mS[ti]?mS[ti].wave_height:null);
+    var swH=s.lake?0:measurement(mS&&mS[ti]?mS[ti].swell_wave_height:null);
+    var wavP=s.lake?0:measurement(mS&&mS[ti]?mS[ti].wave_period:null);
     var sst=s.lake?null:(mS&&mS[ti]?mS[ti].sea_surface_temperature:null);
     var windCtx=windContextForSpot(s,wdir);
-    var a=rateSlot(ws,gs,sh,wavP,prcp,pp,wc,vis,s.exposed,s.lake,er,tmp,sst,windCtx,skillLevel);
-    return{time:['6am','9am','12pm','3pm','6pm'][ti],h:h,ws:ktRound(ws),gs:ktRound(gs),sh:parseFloat(sh.toFixed(1)),swH:parseFloat(swH.toFixed(1)),sp:Math.round(wavP),tmp:tmp,wdir:wdir,dirStr:dir16(wdir),windType:windCtx.type,windLabel:windCtx.label,wc:wc,wcDesc:WMO[wc]||'Unknown',pp:pp,prcp:parseFloat(prcp.toFixed(1)),cc:cc,vis:vis,sst:sst!=null?Math.round(sst):null,rating:a.rating,factors:a.factors,confidence:a.confidence}
+    var a=rateSlot(ws,gs,sh,wavP,prcp,pp,wc,vis,s.exposed,s.lake,er,tmp,sst,windCtx,skillLevel,(wdir==null?['wind direction']:[]).concat(wc==null?['weather code']:[]));
+    return{time:['6am','9am','12pm','3pm','6pm'][ti],h:h,ws:ktRound(ws),gs:ktRound(gs),sh:sh==null?null:parseFloat(sh.toFixed(1)),swH:swH==null?null:parseFloat(swH.toFixed(1)),sp:wavP==null?null:Math.round(wavP),tmp:tmp,wdir:wdir,dirStr:dir16(wdir),windType:windCtx.type,windLabel:windCtx.label,wc:wc,wcDesc:WMO[wc]||'Unknown',pp:pp,prcp:parseFloat(prcp.toFixed(1)),cc:cc,vis:vis,sst:sst!=null?Math.round(sst):null,rating:a.rating,factors:a.factors,confidence:a.confidence,dataComplete:a.dataComplete}
   });
 }
 
@@ -871,13 +905,13 @@ function dayLabels(){
 }
 function rDT(id,act,fn){var el=document.getElementById(id);if(!el)return;el.innerHTML=dayLabels().map(function(d,i){return'<button class="dt '+(i===act?'act':'')+'" onclick="'+fn+'('+i+')"><span class="td">'+d.l+'</span><span class="dd">'+d.d+'</span></button>'}).join('')}
 function uTime(){var n=new Date(),h=n.getHours(),m=String(n.getMinutes()).padStart(2,'0');var el=document.getElementById('liveT');if(el)el.textContent=(h>12?h-12:h||12)+':'+m+' '+(h>=12?'pm':'am')}
-function spotScore(si){var fc=getForecast(si,hDay);if(!fc)return 999;var wt=[1,1.5,2,2,1];return fc.reduce(function(s,f,i){var v=f.rating==='AVOID'?100:f.rating==='CAUTION'?50:0;return s+v*wt[i]},0)}
+function spotScore(si){var fc=getForecast(si,hDay);if(!fc)return Infinity;var wt=[1,1.5,2,2,1];return fc.reduce(function(s,f,i){var v=!f.dataComplete?150:f.rating==='AVOID'?100:f.rating==='CAUTION'?50:0;return s+v*wt[i]},0)}
 
 function sorted(){
   var items=SPOTS.map(function(s,i){return{s:s,i:i}}).filter(function(it){return!sq||it.s.n.toLowerCase().includes(sq)||it.s.t.toLowerCase().includes(sq)});
-  if(srt==='wind')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);return(af?af[2].ws:999)-(bf?bf[2].ws:999)});
-  else if(srt==='swell')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);return(af?af[2].sh:999)-(bf?bf[2].sh:999)});
-  else if(srt==='calm')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);var ac=af?(af[2].ws+af[2].gs*0.5+af[2].sh*20):9999;var bc=bf?(bf[2].ws+bf[2].gs*0.5+bf[2].sh*20):9999;return ac-bc});
+  if(srt==='wind')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);return sortValue(af&&af[2].ws)-sortValue(bf&&bf[2].ws)});
+  else if(srt==='swell')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);return sortValue(af&&af[2].sh)-sortValue(bf&&bf[2].sh)});
+  else if(srt==='calm')items.sort(function(a,b){var af=getForecast(a.i,hDay),bf=getForecast(b.i,hDay);var ac=af&&af[2].dataComplete?(af[2].ws+af[2].gs*0.5+af[2].sh*20):9999;var bc=bf&&bf[2].dataComplete?(bf[2].ws+bf[2].gs*0.5+bf[2].sh*20):9999;return ac-bc});
   else items.sort(function(a,b){return spotScore(a.i)-spotScore(b.i)});
   return items;
 }
@@ -885,7 +919,7 @@ function sorted(){
 function buildCardHTML(spot,si,dayIdx,tsOverride,context){
   var ts=tsOverride!=null?tsOverride:2;
   var fcs=getForecast(si,dayIdx);
-  if(!fcs)return'<div class="cd"><div style="padding:20px;text-align:center;color:var(--text3)">Loading '+spot.n+'…</div></div>';
+  if(!fcs)return'<div class="cd"><div style="padding:20px;text-align:center;color:var(--text3)">'+spot.n+': '+(ready?'Forecast unavailable — check another forecast before paddling.':'Loading…')+'</div></div>';
   var fc=fcs[ts];
   return'<div class="cd" onclick="openSpot('+si+')">'+
     '<div class="cd-h"><div><div class="cd-n">'+spot.n+'</div><div class="cd-t">'+spot.t+(spot.exposed?' · ⚡ Exposed':'')+'</div></div>'+favHeart(spot.id)+'</div>'+
@@ -893,14 +927,14 @@ function buildCardHTML(spot,si,dayIdx,tsOverride,context){
     '<div class="rt-why">'+(fc.factors[0]||'Conditions acceptable')+'</div>'+
     '<div class="wx-line"><span class="wx-pill '+fc.windType+'">🧭 '+fc.dirStr+' · '+fc.windType+'</span><span class="wx-pill '+tideAdviceForSpot(spot).css+'">🌊 '+tideAdviceForSpot(spot).best+'</span></div>'+
     '<div class="cd-m">'+
-      '<div class="m"><div class="m-i">WIND</div><div class="m-v '+(fc.ws>10?'danger':fc.ws>8?'warn':'')+'">'+fc.ws+' kt</div></div>'+
-      '<div class="m"><div class="m-i">GUSTS</div><div class="m-v '+(fc.gs>15?'danger':fc.gs>11?'warn':'')+'">'+fc.gs+' kt</div></div>'+
-      '<div class="m"><div class="m-i">SWELL</div><div class="m-v">'+(spot.lake?'Flat':fc.sh+'m')+'</div></div>'+
+      '<div class="m"><div class="m-i">WIND</div><div class="m-v '+(fc.ws>10?'danger':fc.ws>8?'warn':'')+'">'+metric(fc.ws,' kt')+'</div></div>'+
+      '<div class="m"><div class="m-i">GUSTS</div><div class="m-v '+(fc.gs>15?'danger':fc.gs>11?'warn':'')+'">'+metric(fc.gs,' kt')+'</div></div>'+
+      '<div class="m"><div class="m-i">SWELL</div><div class="m-v">'+(spot.lake?'Flat':metric(fc.sh,'m'))+'</div></div>'+
     '</div>'+
     '<div class="tb" onclick="event.stopPropagation()">'+
       fcs.map(function(f,ti){
         var isAct=(ti===ts);var bgC=f.rating==='GOOD'?'bg-g':f.rating==='CAUTION'?'bg-c':'bg-a';
-        return'<div class="ts '+(isAct?'act '+f.rating:bgC)+'" onclick="event.stopPropagation();'+(context==='favs'?'selFT':'selCT')+'('+si+','+ti+')"><span class="ts-t">'+f.time.toUpperCase()+'</span><span class="ts-w">'+f.ws+'<small>kt</small></span><span class="ts-d">'+f.rating+'</span></div>';
+        return'<div class="ts '+(isAct?'act '+f.rating:bgC)+'" onclick="event.stopPropagation();'+(context==='favs'?'selFT':'selCT')+'('+si+','+ti+')"><span class="ts-t">'+f.time.toUpperCase()+'</span><span class="ts-w">'+metric(f.ws,' kt')+'</span><span class="ts-d">'+f.rating+'</span></div>';
       }).join('')+
     '</div></div>';
 }
@@ -914,9 +948,12 @@ function renderHome(){
   if(!items.length){g.innerHTML='';nr.style.display='block';document.getElementById('tpW').innerHTML='';return}
   nr.style.display='none';
   var best=items[0],bfc=getForecast(best.i,hDay);
+  document.getElementById('tpW').innerHTML='<div class="dn-c" role="status">Forecast unavailable — check another forecast before paddling.</div>';
   if(bfc){
     var ds=buildDaySummary(bfc),dl=dayLabels()[hDay];
-    if(ds.dayRating==='AVOID'){
+    if(bfc.some(function(f){return !f.dataComplete})){
+      document.getElementById('tpW').innerHTML='<div class="dn-c" role="status">Forecast data unavailable. No reliable top pick — check another forecast before paddling.</div>';
+    }else if(ds.dayRating==='AVOID'){
       document.getElementById('tpW').innerHTML='<div class="tp-c" style="background:linear-gradient(135deg,#8a3030,#b04040);cursor:pointer" onclick="openSpot('+best.i+')"><div class="tp-l">⚠️ '+dl.l.toUpperCase()+' — LIMITED OPTIONS</div><div class="tp-n">Best available: '+best.s.n+'</div><div class="tp-d">'+ds.dayDesc+' Check conditions carefully.</div></div>';
     }else{
       var tpSt=ds.dayRating==='CAUTION'?' style="background:linear-gradient(135deg,#8a5600,#b07000)"':'';
@@ -928,7 +965,12 @@ function renderHome(){
 }
 
 function renderDetail(){
-  var si=cur,s=SPOTS[si],fcs=getForecast(si,dDay);if(!fcs)return;
+  var si=cur,s=SPOTS[si],fcs=getForecast(si,dDay);
+  if(!fcs){
+    document.getElementById('dH').innerHTML='<h1>'+s.n+'</h1><div class="sub">Forecast unavailable — check another forecast before paddling.</div>';
+    ['dSum','dMet','fB'].forEach(function(id){document.getElementById(id).innerHTML=''});
+    return;
+  }
   var ds=buildDaySummary(fcs),mid=fcs[2];
   rDT('dDT',dDay,'selDD');
   var rtI=ds.dayRating==='GOOD'?'✅':ds.dayRating==='CAUTION'?'⚠️':'🚫';
@@ -936,8 +978,8 @@ function renderDetail(){
   var mapEl=document.getElementById('mapActions');if(mapEl)mapEl.innerHTML=mapActionsHTML(s);
   var tide=tideAdviceForSpot(s);
   document.getElementById('dSum').innerHTML='<h3 style="font-family:\'DM Sans\',sans-serif;font-size:15px;font-weight:600;margin-bottom:4px">📊 Day Assessment — '+dayLabels()[dDay].l+' · '+(skillLevel==='intermediate'?'Intermediate':'Beginner')+'</h3><div class="ds-row">'+fcs.map(function(f){return'<div class="ds-item '+f.rating+'"><strong>'+f.time+'</strong>'+f.rating+'</div>'}).join('')+'</div><div class="ds-why"><strong>Best wind window:</strong> '+ds.bestWindow+'<br><strong>Tide guidance:</strong> '+tide.best+' — '+tide.risk+'<br><strong>Limiting factors:</strong> '+(ds.allFactors.slice(0,4).join('; ')||'None — conditions suitable')+'</div><div class="ds-conf">Confidence: '+ds.confidence+'</div>';
-  document.getElementById('dMet').innerHTML='<div class="dc"><div class="dc-i">💨</div><div class="dc-v">'+mid.ws+' kt</div><div class="dc-l">Wind</div><div class="dc-s">Gusts '+mid.gs+' kt</div></div><div class="dc"><div class="dc-i">🧭</div><div class="dc-v">'+mid.dirStr+'</div><div class="dc-l">Direction</div><div class="dc-s">'+mid.wdir+'° · '+mid.windType+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+tide.label+'</div><div class="dc-l">Tide</div><div class="dc-s">'+tide.best+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+(s.lake?'Flat':mid.sh+' m')+'</div><div class="dc-l">'+(s.lake?'Surface':'Swell')+'</div><div class="dc-s">'+(s.lake?'No swell':mid.sp+'s period')+'</div></div><div class="dc"><div class="dc-i">🌡️</div><div class="dc-v">'+mid.tmp+'°C</div><div class="dc-l">Air</div><div class="dc-s">'+mid.wcDesc+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+(mid.sst!=null?mid.sst+'°C':'—')+'</div><div class="dc-l">Water</div><div class="dc-s">Sea surface</div></div><div class="dc"><div class="dc-i">👁️</div><div class="dc-v">'+(mid.vis?Math.round(mid.vis/1000)+'km':'—')+'</div><div class="dc-l">Visibility</div><div class="dc-s">'+(mid.cc!=null?mid.cc+'% cloud':'')+'</div></div>';
-  document.getElementById('fB').innerHTML=fcs.map(function(f){var gc=f.gs>15?'var(--red)':f.gs>11?'var(--amb)':'var(--text2)';return'<tr><td style="font-weight:600">'+f.time+'</td><td><span class="fw">'+f.ws+'</span> kt</td><td><span style="color:'+gc+';font-weight:600">'+f.gs+'</span> kt</td><td>'+f.dirStr+'<br><small>'+f.windType+'</small></td><td><span class="fsw">'+(s.lake?'Flat':f.sh+'m')+'</span></td><td>'+(s.lake?'—':f.sp+'s')+'</td><td>'+(f.prcp>0?f.prcp+'mm':'—')+' <small>'+f.pp+'%</small></td><td><span class="ftp">'+f.tmp+'°C</span></td><td>'+(f.sst!=null?f.sst+'°C':'—')+'</td><td>'+(f.vis?Math.round(f.vis/1000)+'km':'—')+'</td><td><span class="fb '+f.rating+'">'+f.rating+'</span></td><td style="text-align:left;font-size:11px;color:var(--text2);max-width:200px">'+(f.factors[0]||'OK')+'</td></tr>'}).join('');
+  document.getElementById('dMet').innerHTML='<div class="dc"><div class="dc-i">💨</div><div class="dc-v">'+metric(mid.ws,' kt')+'</div><div class="dc-l">Wind</div><div class="dc-s">Gusts '+metric(mid.gs,' kt')+'</div></div><div class="dc"><div class="dc-i">🧭</div><div class="dc-v">'+mid.dirStr+'</div><div class="dc-l">Direction</div><div class="dc-s">'+metric(mid.wdir,'°')+' · '+mid.windType+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+tide.label+'</div><div class="dc-l">Tide</div><div class="dc-s">'+tide.best+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+(s.lake?'Flat':metric(mid.sh,' m'))+'</div><div class="dc-l">'+(s.lake?'Surface':'Swell')+'</div><div class="dc-s">'+(s.lake?'No swell':metric(mid.sp,'s period'))+'</div></div><div class="dc"><div class="dc-i">🌡️</div><div class="dc-v">'+mid.tmp+'°C</div><div class="dc-l">Air</div><div class="dc-s">'+mid.wcDesc+'</div></div><div class="dc"><div class="dc-i">🌊</div><div class="dc-v">'+(mid.sst!=null?mid.sst+'°C':'—')+'</div><div class="dc-l">Water</div><div class="dc-s">Sea surface</div></div><div class="dc"><div class="dc-i">👁️</div><div class="dc-v">'+(mid.vis?Math.round(mid.vis/1000)+'km':'—')+'</div><div class="dc-l">Visibility</div><div class="dc-s">'+(mid.cc!=null?mid.cc+'% cloud':'')+'</div></div>';
+  document.getElementById('fB').innerHTML=fcs.map(function(f){var gc=f.gs>15?'var(--red)':f.gs>11?'var(--amb)':'var(--text2)';return'<tr><td style="font-weight:600">'+f.time+'</td><td><span class="fw">'+metric(f.ws,' kt')+'</span></td><td><span style="color:'+gc+';font-weight:600">'+metric(f.gs,' kt')+'</span></td><td>'+f.dirStr+'<br><small>'+f.windType+'</small></td><td><span class="fsw">'+(s.lake?'Flat':metric(f.sh,'m'))+'</span></td><td>'+(s.lake?'—':metric(f.sp,'s'))+'</td><td>'+(f.prcp>0?f.prcp+'mm':'—')+' <small>'+f.pp+'%</small></td><td><span class="ftp">'+f.tmp+'°C</span></td><td>'+(f.sst!=null?f.sst+'°C':'—')+'</td><td>'+(f.vis?Math.round(f.vis/1000)+'km':'—')+'</td><td><span class="fb '+f.rating+'">'+f.rating+'</span></td><td style="text-align:left;font-size:11px;color:var(--text2);max-width:200px">'+(f.factors[0]||'OK')+'</td></tr>'}).join('');
   document.getElementById('tC').innerHTML='<h3>📍 Local Tips — '+s.n+'</h3>'+s.tips.map(function(t){return'<div class="ti"><span class="ti-i">'+t.i+'</span><span>'+t.t+'</span></div>'}).join('');
 }
 
